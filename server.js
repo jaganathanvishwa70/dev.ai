@@ -3,9 +3,8 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "20mb" })); // ✅ supports large image/PDF uploads
+app.use(express.json({ limit: "20mb" }));
 
-// ✅ Check API key
 if (!process.env.SAMBANOVA_API_KEY) {
   console.error("❌ SAMBANOVA_API_KEY is missing!");
   process.exit(1);
@@ -14,22 +13,22 @@ if (!process.env.SAMBANOVA_API_KEY) {
 const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY;
 const SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions";
 
-// ✅ ONE MODEL for BOTH text and image/PDF
-const MODEL = "Llama-4-Maverick-17B-128E-Instruct";
+// ✅ SMART MODEL SWITCHING
+// Normal chat → fast model (higher rate limits, no 429)
+// Image/PDF upload → vision model
+const TEXT_MODEL   = "Meta-Llama-3.3-70B-Instruct";       // high rate limit ✅
+const VISION_MODEL = "Llama-4-Maverick-17B-128E-Instruct"; // for images only
 
-// ✅ Health check
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 app.get("/", (req, res) => {
-  res.json({ message: "🚀 Deva AI backend is running!", model: MODEL });
+  res.json({ message: "🚀 Deva AI backend running!", textModel: TEXT_MODEL, visionModel: VISION_MODEL });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", model: MODEL });
+  res.json({ status: "ok", textModel: TEXT_MODEL, visionModel: VISION_MODEL });
 });
 
-// ✅ Wait helper (for retry delay)
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// ✅ Chat route — handles BOTH text and image/PDF
 app.post("/api/chat", async (req, res) => {
   try {
     const { systemPrompt, messages, hasImages } = req.body;
@@ -38,46 +37,32 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Messages array is required" });
     }
 
-    // Build messages array
+    // ✅ Choose model — only use vision model if images present
+    const MODEL = hasImages ? VISION_MODEL : TEXT_MODEL;
+
+    // Build messages
     const chatMessages = [];
 
-    // Add system prompt
     if (systemPrompt) {
-      chatMessages.push({
-        role: "system",
-        content: systemPrompt,
-      });
+      chatMessages.push({ role: "system", content: systemPrompt });
     }
 
-    // Add conversation messages
     messages.forEach((m) => {
       if (Array.isArray(m.content)) {
-        // ✅ Message contains images or PDFs
         const contentParts = m.content.map((part) => {
-          if (part.type === "text") {
-            return { type: "text", text: part.text };
-          } else if (part.type === "image") {
-            // ✅ Image as base64
-            return {
-              type: "image_url",
-              image_url: {
-                url: `data:${part.source.media_type};base64,${part.source.data}`,
-              },
-            };
-          } else if (part.type === "document") {
-            // ✅ PDF as base64
-            return {
-              type: "image_url",
-              image_url: {
-                url: `data:application/pdf;base64,${part.source.data}`,
-              },
-            };
-          }
+          if (part.type === "text") return { type: "text", text: part.text };
+          if (part.type === "image") return {
+            type: "image_url",
+            image_url: { url: `data:${part.source.media_type};base64,${part.source.data}` },
+          };
+          if (part.type === "document") return {
+            type: "image_url",
+            image_url: { url: `data:application/pdf;base64,${part.source.data}` },
+          };
           return part;
         });
         chatMessages.push({ role: m.role, content: contentParts });
       } else {
-        // ✅ Plain text message
         chatMessages.push({
           role: m.role === "assistant" ? "assistant" : "user",
           content: m.content,
@@ -85,10 +70,9 @@ app.post("/api/chat", async (req, res) => {
       }
     });
 
-    console.log(`📡 Model: ${MODEL} | Messages: ${chatMessages.length} | Has images: ${!!hasImages}`);
+    console.log(`📡 Model: ${MODEL} | Messages: ${chatMessages.length} | Images: ${!!hasImages}`);
 
-    // ✅ SambaNova API call WITH auto-retry on 429
-    let reply = null;
+    // ✅ Retry loop — handles 429 automatically
     const maxRetries = 4;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -107,39 +91,31 @@ app.post("/api/chat", async (req, res) => {
         }),
       });
 
-      // ✅ Handle 429 - wait and retry automatically
       if (response.status === 429) {
-        const waitSeconds = attempt * 4; // 4s, 8s, 12s, 16s
-        console.log(`⚠️ Rate limit hit (429). Attempt ${attempt}/${maxRetries}. Retrying in ${waitSeconds}s...`);
-
+        const waitSec = attempt * 5; // 5s → 10s → 15s → 20s
+        console.log(`⚠️ 429 Rate limit. Attempt ${attempt}/${maxRetries}. Waiting ${waitSec}s...`);
         if (attempt < maxRetries) {
-          await sleep(waitSeconds * 1000);
-          continue; // retry
+          await sleep(waitSec * 1000);
+          continue;
         } else {
-          // All retries exhausted
-          console.error("❌ All retries failed due to rate limiting.");
+          console.error("❌ All retries failed.");
           return res.status(429).json({
-            error: "🙏 The AI is temporarily busy. Please wait a few seconds and try again.",
+            error: "🙏 Our divine servers are meditating. Please wait a moment and try again.",
           });
         }
       }
 
-      // ✅ Handle other errors
       if (!response.ok) {
         const errText = await response.text();
-        console.error("❌ SambaNova API Error:", errText);
-        return res.status(response.status).json({
-          error: "SambaNova API error: " + errText,
-        });
+        console.error("❌ API Error:", errText);
+        return res.status(response.status).json({ error: "API error: " + errText });
       }
 
-      // ✅ Success
       const data = await response.json();
-      reply = data.choices?.[0]?.message?.content || "No response received.";
-      break; // exit retry loop
+      const reply = data.choices?.[0]?.message?.content || "No response received.";
+      console.log(`✅ Success on attempt ${attempt}`);
+      return res.json({ reply });
     }
-
-    res.json({ reply });
 
   } catch (error) {
     console.error("❌ Server Error:", error.message);
@@ -150,6 +126,7 @@ app.post("/api/chat", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🚀 Deva AI backend running on port ${PORT}`);
-  console.log(`✅ Model: ${MODEL} (text + image + PDF)`);
-  console.log(`✅ Auto-retry on 429 rate limits: enabled`);
+  console.log(`✅ Text model : ${TEXT_MODEL}`);
+  console.log(`✅ Vision model: ${VISION_MODEL}`);
+  console.log(`✅ Auto-retry on 429: enabled`);
 });
