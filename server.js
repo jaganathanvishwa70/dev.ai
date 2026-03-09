@@ -26,6 +26,9 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", model: MODEL });
 });
 
+// ✅ Wait helper (for retry delay)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ✅ Chat route — handles BOTH text and image/PDF
 app.post("/api/chat", async (req, res) => {
   try {
@@ -84,30 +87,57 @@ app.post("/api/chat", async (req, res) => {
 
     console.log(`📡 Model: ${MODEL} | Messages: ${chatMessages.length} | Has images: ${!!hasImages}`);
 
-    // ✅ SambaNova API call
-    const response = await fetch(SAMBANOVA_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${SAMBANOVA_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: chatMessages,
-        max_tokens: 4000,
-        temperature: 0.9,
-        stream: false,
-      }),
-    });
+    // ✅ SambaNova API call WITH auto-retry on 429
+    let reply = null;
+    const maxRetries = 4;
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("❌ SambaNova API Error:", errText);
-      return res.status(response.status).json({ error: "SambaNova API error: " + errText });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const response = await fetch(SAMBANOVA_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${SAMBANOVA_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          max_tokens: 4000,
+          temperature: 0.9,
+          stream: false,
+        }),
+      });
+
+      // ✅ Handle 429 - wait and retry automatically
+      if (response.status === 429) {
+        const waitSeconds = attempt * 4; // 4s, 8s, 12s, 16s
+        console.log(`⚠️ Rate limit hit (429). Attempt ${attempt}/${maxRetries}. Retrying in ${waitSeconds}s...`);
+
+        if (attempt < maxRetries) {
+          await sleep(waitSeconds * 1000);
+          continue; // retry
+        } else {
+          // All retries exhausted
+          console.error("❌ All retries failed due to rate limiting.");
+          return res.status(429).json({
+            error: "🙏 The AI is temporarily busy. Please wait a few seconds and try again.",
+          });
+        }
+      }
+
+      // ✅ Handle other errors
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("❌ SambaNova API Error:", errText);
+        return res.status(response.status).json({
+          error: "SambaNova API error: " + errText,
+        });
+      }
+
+      // ✅ Success
+      const data = await response.json();
+      reply = data.choices?.[0]?.message?.content || "No response received.";
+      break; // exit retry loop
     }
-
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content || "No response received.";
 
     res.json({ reply });
 
@@ -121,4 +151,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🚀 Deva AI backend running on port ${PORT}`);
   console.log(`✅ Model: ${MODEL} (text + image + PDF)`);
+  console.log(`✅ Auto-retry on 429 rate limits: enabled`);
 });
